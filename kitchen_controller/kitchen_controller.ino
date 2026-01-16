@@ -1,10 +1,4 @@
-/****************************************************
- * SMART HOME CONTROLLER - ESP32 (FreeRTOS Optimized)
- * Chức năng:
- * - 1 Dải LED (Pin 26): Manual (MQTT) + Auto (PIR)
- * - Quản lý thẻ RFID: Thêm/Xóa/Mở cửa qua MQTT
- * - Servo: Đóng mở cửa tự động
- ****************************************************/
+// SMART HOME CONTROLLER - ESP32 (FreeRTOS Optimized)
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -14,71 +8,66 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <ESP32Servo.h>
-#include <Preferences.h> // Lưu trữ thẻ vào Flash
+#include <Preferences.h> 
 #include <vector>
 
-/*************** PHẦN CỨNG ****************/
+// PHẦN CỨNG
 #define SS_PIN          5
 #define RST_PIN         22
-
-// CHỈ DÙNG 1 DẢI LED
 #define PIN_LED_STRIP   26 
-#define NUM_LEDS        16  // Số lượng bóng LED (tùy chỉnh)
-
+#define NUM_LEDS        16  
 #define PIN_SERVO       4
 #define PIN_PIR         34
 
-/*************** MQTT CONFIG ****************/
+// MQTT CONFIG
 const char* mqtt_server = "68.183.188.187";
 const int   mqtt_port   = 1885;
 const char* mqtt_user   = "mqtt_admin";
 const char* mqtt_pass   = "12345678@abc";
 
-// Các Topic MQTT
 const char* topic_cmd        = "smart_home/controller-02/cmd";
 const char* topic_rfid_event = "smart_home/controller-02/rfid/event";
 const char* topic_rfid_list  = "smart_home/controller-02/rfid/list";
-const char* topic_status     = "smart_home/controller-02/status";
+const char* topic_status     = "smart_home/controller-02/112/status";
 
-/*************** ĐỐI TƯỢNG TOÀN CỤC ***************/
+// ĐỐI TƯỢNG TOÀN CỤC
 WiFiClient espClient;
 PubSubClient client(espClient);
-
 Adafruit_NeoPixel pixels(NUM_LEDS, PIN_LED_STRIP, NEO_GRB + NEO_KHZ800);
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 Servo myServo;
-Preferences preferences; // Đối tượng lưu trữ Flash
+Preferences preferences; 
 
-/*************** QUẢN LÝ TRẠNG THÁI LED (SHARED) ***************/
-// Cấu trúc này được chia sẻ giữa TaskPIR (ghi), TaskMQTT (ghi) và TaskLED (đọc)
+// QUẢN LÝ TRẠNG THÁI LED
+// Cấu trúc dữ liệu dùng chung để đồng bộ giữa các Task
 struct LedState {
-  bool manual_on;       // True: Bật thủ công qua MQTT (ghi đè PIR)
-  uint32_t color;       // Màu sắc
-  int brightness;       // Độ sáng
-  bool pir_active;      // True: PIR đang phát hiện chuyển động
-  unsigned long pir_timer; // Thời gian đếm lùi tắt PIR
+  bool manual_on;              // Bật cưỡng bức từ App
+  uint32_t color;              // Màu LED
+  int brightness;              // Độ sáng
+  bool pir_active;             // Trạng thái PIR
+  unsigned long pir_timer;     // Timer tắt LED sau PIR
 } sysLed;
-bool lastLedOn = false;
 
+// Mutex bảo vệ sysLed
+SemaphoreHandle_t ledMutex; 
 
-SemaphoreHandle_t ledMutex; // Khóa bảo vệ biến sysLed (tránh xung đột dữ liệu)
-
-/*************** QUẢN LÝ HỆ THỐNG ***************/
+// QUẢN LÝ HỆ THỐNG
 enum SystemMode { MODE_NORMAL, MODE_ADD, MODE_DELETE };
 SystemMode currentMode = MODE_NORMAL;
 
 bool servoOpen = false;
 unsigned long servoTimer = 0;
-std::vector<String> authorizedCards; // Danh sách thẻ trong RAM
+std::vector<String> authorizedCards;
 
-// Hàng đợi tin nhắn MQTT (Để các Task con gửi tin về Loop chính)
+// Gói tin MQTT dùng cho Queue
 struct MqttMessage {
   char topic[64];
   char payload[256];
 };
+
 QueueHandle_t mqttQueue;
 
-/*************** KHAI BÁO HÀM ***************/
+// KHAI BÁO HÀM
 void loadCards();
 void saveCard(String uid);
 void deleteCard(String uid);
@@ -87,199 +76,174 @@ String dumpByteArray(byte *buffer, byte bufferSize);
 void sendMqttFromTask(const char* topic, String payload);
 uint32_t hexToColor(String hex);
 void publishCardList();
+void publishLedStatus(bool isOn);
 
-/****************************************************************
- * TASK 1: PIR SENSOR (Core 1)
- * Đọc cảm biến chuyển động, cập nhật trạng thái vào sysLed
- ****************************************************************/
+// TASK 1: XỬ LÝ CẢM BIẾN PIR
 void TaskPIR(void *pvParameters) {
   pinMode(PIN_PIR, INPUT);
-  
+
   for (;;) {
     int val = digitalRead(PIN_PIR);
-    
-    // Dùng Mutex để ghi vào biến shared an toàn
+
+    // Chiếm quyền truy cập biến sysLed bằng Mutex
     if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
       if (val == HIGH) {
         sysLed.pir_active = true;
-        sysLed.pir_timer = millis() + 3000; // Có chuyển động -> Reset timer 3s
+        sysLed.pir_timer = millis() + 3000;
       }
-      
-      // Kiểm tra timeout: Nếu quá 3s không có chuyển động -> Tắt flag PIR
+      // Kiểm tra nếu hết thời gian chờ thì tắt flag PIR
       if (sysLed.pir_active && millis() > sysLed.pir_timer) {
         sysLed.pir_active = false;
       }
-      xSemaphoreGive(ledMutex);
+      xSemaphoreGive(ledMutex);// Giải phóng khóa sau khi ghi xong
     }
-    
-    vTaskDelay(100 / portTICK_PERIOD_MS); // Check mỗi 100ms
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-/****************************************************************
- * TASK 2: LED CONTROLLER (Core 1)
- * Điều khiển thực tế NeoPixel dựa trên logic: Manual || PIR
- ****************************************************************/
-/****************************************************************
- * TASK 2: LED CONTROLLER (Core 1)
- * Điều khiển NeoPixel + gửi status khi ON/OFF thay đổi
- ****************************************************************/
+// TASK 2: ĐIỀU KHIỂN LED NEOPIXEL
 void TaskLED(void *pvParameters) {
   pixels.begin();
   pixels.clear();
   pixels.show();
 
-  bool lastLedOn = false; // Lưu trạng thái LED trước đó
+  bool lastLedState = false;
 
   for (;;) {
     bool shouldBeOn;
     uint32_t targetColor;
     int targetBright;
-
-    /* Đọc trạng thái dùng Mutex */
+    // Đọc thông số điều khiển từ biến chung sysLed
     if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
       shouldBeOn   = sysLed.manual_on || sysLed.pir_active;
       targetColor  = sysLed.color;
       targetBright = sysLed.brightness;
       xSemaphoreGive(ledMutex);
     }
-
-    /* Nếu trạng thái LED thay đổi -> gửi status */
-    if (shouldBeOn != lastLedOn) {
+    // Chỉ gửi tin nhắn MQTT khi trạng thái LED thực tế thay đổi
+    if (shouldBeOn != lastLedState) {
       publishLedStatus(shouldBeOn);
-      lastLedOn = shouldBeOn;
+      lastLedState = shouldBeOn;
     }
 
-    /* Điều khiển LED */
+    // Cập nhật hiệu ứng lên dải LED
     pixels.setBrightness(targetBright);
-
     if (shouldBeOn) {
-      for (int i = 0; i < NUM_LEDS; i++) {
+      for (int i = 0; i < NUM_LEDS; i++)
         pixels.setPixelColor(i, targetColor);
-      }
     } else {
       pixels.clear();
     }
-
     pixels.show();
-    vTaskDelay(100 / portTICK_PERIOD_MS); // 10Hz là đủ
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-
-/****************************************************************
- * TASK 3: SERVO (Core 1)
- * Quản lý đóng/mở cửa không chặn chương trình
- ****************************************************************/
+// TASK 3: ĐIỀU KHIỂN SERVO
 void TaskServo(void *pvParameters) {
-  myServo.write(0); // Mặc định khóa
-  
+  myServo.write(0);
+
   for (;;) {
     if (servoOpen) {
-      myServo.write(90); // Mở
-      
-      // Kiểm tra hết giờ mở cửa
+      myServo.write(90);
+
+      // Tự động đóng cửa sau khi hết thời gian timer
       if (millis() > servoTimer) {
         servoOpen = false;
-        myServo.write(0); // Đóng lại
-        sendMqttFromTask(topic_status, "{\"device\":\"servo\", \"state\":\"LOCKED\"}");
+        myServo.write(0);
+        sendMqttFromTask(
+          topic_status,
+          "{\"device\":\"servo\",\"state\":\"LOCKED\"}"
+        );
       }
-    } else {
-      // Đảm bảo luôn đóng nếu không có cờ mở
-      myServo.write(0); 
     }
     vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-/****************************************************************
- * TASK 4: RFID READER (Core 0)
- * Quét thẻ và xử lý logic Thêm/Xóa/Mở
- ****************************************************************/
+// TASK 4: RFID
 void TaskRFID(void *pvParameters) {
   SPI.begin();
   mfrc522.PCD_Init();
 
   for (;;) {
-    // Nếu không có thẻ -> nghỉ 50ms rồi check lại
-    if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
+    // Kiểm tra xem có thẻ mới đưa vào vùng đọc không
+    if (!mfrc522.PICC_IsNewCardPresent() ||
+        !mfrc522.PICC_ReadCardSerial()) {
       vTaskDelay(50 / portTICK_PERIOD_MS);
       continue;
     }
 
-    // Có thẻ -> Đọc UID
-    String uidStr = dumpByteArray(mfrc522.uid.uidByte, mfrc522.uid.size);
+    // Chuyển mã UID của thẻ sang dạng chuỗi HEX
+    String uidStr = dumpByteArray(
+      mfrc522.uid.uidByte,
+      mfrc522.uid.size
+    );
+
     StaticJsonDocument<300> doc;
     doc["uid"] = uidStr;
-
-    // XỬ LÝ THEO CHẾ ĐỘ HIỆN TẠI
+    //xử lý theo chế độ Mode hiện tại
     if (currentMode == MODE_ADD) {
       if (!checkCard(uidStr)) {
-        saveCard(uidStr);
-        doc["action"] = "ADDED";
+        saveCard(uidStr);// Lưu vào bộ nhớ Flash
         doc["status"] = "SUCCESS";
       } else {
-        doc["action"] = "ADDED";
         doc["status"] = "EXISTED";
       }
-      currentMode = MODE_NORMAL; // Xong việc quay về bình thường
-      sendMqttFromTask(topic_rfid_list, "UPDATE_REQUEST"); // Yêu cầu gửi lại danh sách
-    } 
-    else if (currentMode == MODE_DELETE) {
-      if (checkCard(uidStr)) {
-        deleteCard(uidStr);
-        doc["action"] = "DELETED";
-        doc["status"] = "SUCCESS";
-      } else {
-        doc["action"] = "DELETED";
-        doc["status"] = "NOT_FOUND";
-      }
+      doc["action"] = "ADDED";
       currentMode = MODE_NORMAL;
       sendMqttFromTask(topic_rfid_list, "UPDATE_REQUEST");
-    } 
-    else { 
-      // MODE NORMAL: Mở cửa
+    }
+    else if (currentMode == MODE_DELETE) {
+      if (checkCard(uidStr)) {
+        deleteCard(uidStr);// Xóa khỏi bộ nhớ Flash
+        doc["status"] = "SUCCESS";
+      } else {
+        doc["status"] = "NOT_FOUND";
+      }
+      doc["action"] = "DELETED";
+      currentMode = MODE_NORMAL;
+      sendMqttFromTask(topic_rfid_list, "UPDATE_REQUEST");
+    }
+    else {
+      // Chế độ bình thường: Kiểm tra quyền truy cập để mở cửa
       if (checkCard(uidStr)) {
         doc["access"] = "GRANTED";
-        servoOpen = true; // Kích hoạt TaskServo
-        servoTimer = millis() + 5000; // Mở 5s
+        servoOpen = true;
+        servoTimer = millis() + 5000;// Hẹn giờ đóng cửa sau 5s
       } else {
         doc["access"] = "DENIED";
       }
     }
+    // Đẩy kết quả quẹt thẻ vào Queue để gửi lên MQTT
+    String out;
+    serializeJson(doc, out);
+    sendMqttFromTask(topic_rfid_event, out);
 
-    // Gửi sự kiện quẹt thẻ lên MQTT
-    String jsonOutput;
-    serializeJson(doc, jsonOutput);
-    sendMqttFromTask(topic_rfid_event, jsonOutput);
-
-    // Dừng thẻ để không đọc lại liên tục
+    // Lệnh dừng giao tiếp với thẻ để tránh việc đọc lặp lại nhiều lần
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Chống spam thẻ
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
 
-/****************************************************************
- * HÀM HỖ TRỢ & LOGIC DỮ LIỆU
- ****************************************************************/
 
-// Đẩy message vào hàng đợi để Main Loop gửi đi (Thread-safe)
+// Gửi tin nhắn vào hàng đợi an toàn cho đa luồng
 void sendMqttFromTask(const char* topic, String payload) {
   MqttMessage msg;
   strncpy(msg.topic, topic, sizeof(msg.topic));
   strncpy(msg.payload, payload.c_str(), sizeof(msg.payload));
-  xQueueSend(mqttQueue, &msg, 0);
+  xQueueSend(mqttQueue, &msg, 0); // Đẩy gói tin vào đuôi hàng đợi
 }
 
-// Chuyển đổi HEX color
+// Chuyển mã màu Hex (vd: #FF0000) sang định dạng uint32 của NeoPixel
 uint32_t hexToColor(String hex) {
   if (hex.startsWith("#")) hex.remove(0, 1);
   long number = strtol(hex.c_str(), NULL, 16);
   return (uint32_t)number;
 }
 
-// Chuyển UID bytes sang String HEX
+// Chuyển mảng byte UID sang String để dễ so sánh
 String dumpByteArray(byte *buffer, byte bufferSize) {
   String res = ""; 
   for (byte i = 0; i < bufferSize; i++) { 
@@ -290,9 +254,9 @@ String dumpByteArray(byte *buffer, byte bufferSize) {
   return res;
 }
 
-// --- QUẢN LÝ FLASH (PREFERENCES) ---
+// Tải danh sách thẻ từ bộ nhớ Flash vào RAM khi khởi động
 void loadCards() {
-  preferences.begin("rfid_data", true); // Read mode
+  preferences.begin("rfid_data", true); 
   String cardString = preferences.getString("cards", "");
   preferences.end();
   
@@ -307,10 +271,9 @@ void loadCards() {
   if (start < cardString.length()) authorizedCards.push_back(cardString.substring(start));
 }
 
-/* Gửi trạng thái LED hiện tại lên MQTT */
+// Gói trạng thái LED hiện tại thành JSON và gửi đi
 void publishLedStatus(bool isOn) {
   StaticJsonDocument<256> doc;
-
   doc["device"] = "led";
   doc["state"]  = isOn ? "ON" : "OFF";
   doc["mode"]   = sysLed.manual_on ? "MANUAL" : "AUTO";
@@ -318,18 +281,17 @@ void publishLedStatus(bool isOn) {
 
   char buffer[256];
   serializeJson(doc, buffer);
-
   sendMqttFromTask(topic_status, buffer);
 }
 
-
+// Lưu danh sách mảng RAM xuống bộ nhớ Flash bền vững
 void saveCardsToFlash() {
   String cardString = "";
   for (size_t i = 0; i < authorizedCards.size(); i++) {
     cardString += authorizedCards[i];
     if (i < authorizedCards.size() - 1) cardString += ",";
   }
-  preferences.begin("rfid_data", false); // Write mode
+  preferences.begin("rfid_data", false); 
   preferences.putString("cards", cardString);
   preferences.end();
 }
@@ -347,7 +309,7 @@ bool checkCard(String uid) {
   return false; 
 }
 
-// Gửi danh sách thẻ hiện có lên MQTT
+// Gửi toàn bộ danh sách thẻ hiện có lên MQTT cho App cập nhật
 void publishCardList() {
   StaticJsonDocument<1024> doc; 
   JsonArray list = doc.createNestedArray("cards");
@@ -355,28 +317,21 @@ void publishCardList() {
   
   char buffer[1024]; 
   serializeJson(doc, buffer); 
-  client.publish(topic_rfid_list, buffer);
+  client.publish(topic_rfid_list, buffer, true);
 }
 
-/****************************************************************
- * MQTT CALLBACK & MAIN SETUP
- ****************************************************************/
 
-// Xử lý lệnh nhận được từ MQTT
+// Hàm xử lý khi có dữ liệu từ Server gửi xuống (Topic: topic_cmd)
 void callback(char* topic, byte* payload, unsigned int length) {
   StaticJsonDocument<512> doc;
   deserializeJson(doc, payload, length);
 
-  // 1. LỆNH ĐIỀU KHIỂN LED
+  // Xử lý nhóm lệnh điều khiển LED
   if (doc.containsKey("led")) {
     JsonObject ledCmd = doc["led"];
-    
-    // Lock Mutex để cập nhật biến sysLed an toàn
     if (xSemaphoreTake(ledMutex, portMAX_DELAY)) {
       if (ledCmd.containsKey("state")) {
         const char* st = ledCmd["state"];
-        // Nếu OFF -> Tắt chế độ Manual, chuyển về Auto PIR
-        // Nếu ON -> Bật chế độ Manual, đèn sáng mãi
         sysLed.manual_on = (strcmp(st, "ON") == 0);
       }
       if (ledCmd.containsKey("color")) {
@@ -387,34 +342,27 @@ void callback(char* topic, byte* payload, unsigned int length) {
       }
       xSemaphoreGive(ledMutex);
     }
-    // Gửi phản hồi
     sendMqttFromTask(topic_status, "{\"msg\":\"LED Updated\"}");
   }
 
-  // 2. LỆNH HỆ THỐNG (MODE THẺ)
+  // Xử lý nhóm lệnh thay đổi chế độ quản lý thẻ
   if (doc.containsKey("mode")) {
     const char* mode = doc["mode"];
-    if (strcmp(mode, "ADD") == 0) {
-        currentMode = MODE_ADD;
-        sendMqttFromTask(topic_status, "{\"mode\":\"WAITING_FOR_CARD_TO_ADD\"}");
-    }
-    else if (strcmp(mode, "DELETE") == 0) {
-        currentMode = MODE_DELETE;
-        sendMqttFromTask(topic_status, "{\"mode\":\"WAITING_FOR_CARD_TO_DELETE\"}");
-    }
-    else {
-        currentMode = MODE_NORMAL;
-        sendMqttFromTask(topic_status, "{\"mode\":\"NORMAL\"}");
-    }
+    if (strcmp(mode, "ADD") == 0) currentMode = MODE_ADD;
+    else if (strcmp(mode, "DELETE") == 0) currentMode = MODE_DELETE;
+    else currentMode = MODE_NORMAL;
+    
+    sendMqttFromTask(topic_status, "{\"mode_changed\":\"" + String(mode) + "\"}");
   }
 }
 
+// Hàm duy trì kết nối MQTT Broker
 void reconnect() {
   while (!client.connected()) {
     String clientId = "ESP32-Home-" + String(random(0xffff), HEX);
     if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       client.subscribe(topic_cmd);
-      publishCardList(); // Gửi danh sách thẻ ngay khi kết nối
+      publishCardList(); 
     } else delay(5000);
   }
 }
@@ -422,29 +370,27 @@ void reconnect() {
 void setup() {
   Serial.begin(115200);
 
-  // Cấu hình LED mặc định
-  sysLed.manual_on = false; // Mặc định chạy theo PIR
-  sysLed.color = pixels.Color(255, 255, 255); // Trắng
+  // Khởi tạo các giá trị mặc định cho hệ thống LED
+  sysLed.manual_on = false; 
+  sysLed.color = pixels.Color(255, 255, 255); 
   sysLed.brightness = 100;
   sysLed.pir_active = false;
-  sysLed.pir_timer = 0;
 
-  ledMutex = xSemaphoreCreateMutex(); // Tạo khóa Mutex
+  ledMutex = xSemaphoreCreateMutex(); // Tạo Mutex để bảo vệ biến dùng chung
+  mqttQueue = xQueueCreate(10, sizeof(MqttMessage)); // Khởi tạo hàng đợi 10 tin nhắn
 
   myServo.attach(PIN_SERVO);
-  loadCards(); // Tải thẻ từ Flash
+  loadCards(); 
 
+  // Cấu hình Wi-Fi SmartConfig
   WiFiManager wm;
   if (!wm.autoConnect("SmartHome_Ctrl","12345678")) ESP.restart();
 
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
 
-  // Tạo hàng đợi tin nhắn
-  mqttQueue = xQueueCreate(10, sizeof(MqttMessage));
-
-  // KHỞI TẠO CÁC TASKS (FreeRTOS)
-  // TaskRFID, LED chạy Core 1; WiFi chạy Core 0 (mặc định của Arduino ESP32)
+  // KHỞI TẠO CÁC TASK CHẠY SONG SONG TRÊN CORE 1
+  // Tham số: Tên hàm, Tên Task, Stack size, Tham số, Độ ưu tiên, Handle, Core ID
   xTaskCreatePinnedToCore(TaskRFID, "TaskRFID", 4096, NULL, 2, NULL, 1);
   xTaskCreatePinnedToCore(TaskPIR,  "TaskPIR",  2048, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskServo,"TaskServo",2048, NULL, 1, NULL, 1);
@@ -452,16 +398,14 @@ void setup() {
 }
 
 void loop() {
-  // Loop này đóng vai trò duy trì kết nối mạng và gửi tin
+  // Loop chính chỉ tập trung quản lý kết nối và đẩy tin nhắn từ Queue lên Server
   if (!client.connected()) reconnect();
   client.loop();
 
-  // Kiểm tra hàng đợi xem có Task nào gửi tin không
+  // Kiểm tra nếu có dữ liệu chờ trong hàng đợi
   MqttMessage msg;
   if (xQueueReceive(mqttQueue, &msg, 0) == pdTRUE) {
-    // Nếu là lệnh nội bộ yêu cầu update list
     if (String(msg.payload) == "UPDATE_REQUEST") publishCardList();
-    // Nếu là tin nhắn thường
-    else client.publish(msg.topic, msg.payload);
+    else client.publish(msg.topic, msg.payload, true);
   }
 }
